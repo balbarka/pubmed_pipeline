@@ -208,6 +208,10 @@ pubmed = PubMedConfig(_catalog_name = PUBMED_CATALOG,
 
 # COMMAND ----------
 
+spark.conf.set("pubmed_metadata_name", pubmed.raw_metadata.name)
+
+# COMMAND ----------
+
 inspect_assets = dbutils.widgets.getArgument("DISPLAY_CONFIGS")
 if inspect_assets == 'true':
     inspect_html = f"""<table border="1" cellpadding="10">

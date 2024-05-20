@@ -71,7 +71,7 @@ readStream_columns = [F.col("Key"),
                       F.lit(None).alias('volume_path')]
 
 def upsert_metadata(microBatchOutputDF: DataFrame, batchId: int):
-    tgt_df = pubmed.raw_metadata.dt.alias("tgt")
+    tgt_df = DeltaTable.forName(spark, spark.conf.get("pubmed_metadata_name")).alias("tgt")
     tgt_df.merge(source = microBatchOutputDF.alias("src"),
                  condition = "src.AccessionID = tgt.AccessionID") \
         .whenMatchedUpdateAll(condition="src.LastUpdated > tgt.LastUpdated") \
