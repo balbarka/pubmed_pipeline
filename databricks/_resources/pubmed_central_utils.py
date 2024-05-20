@@ -19,6 +19,14 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install beautifulsoup4
+
+# COMMAND ----------
+
+# MAGIC %reload_ext autoreload
+
+# COMMAND ----------
+
 import defusedxml.ElementTree as ET
 from typing import Iterator, Optional, Union, List
 from time import sleep
@@ -28,7 +36,10 @@ import requests
 from requests.models import Response
 from functools import cached_property
 from delta.tables import DeltaTable
-from pyspark.sql.functions import col, lit, least
+from pyspark.sql.functions import col, lit, least, xpath_string
+from pyspark.sql.types import StructType, MapType, StringType, StructField
+from pyspark.sql import Row
+from bs4 import BeautifulSoup
 
 # COMMAND ----------
 
@@ -64,6 +75,7 @@ def searchPMCPapers(keyword: str,
 
     return pmids
 
+
 # COMMAND ----------
 
 # Get a date range that will avoid creating gaps in search range from previous runs
@@ -80,8 +92,8 @@ def get_search_hist_args(keywords: Union[str, List[str]],
                          .withColumn('h_min', F.coalesce(F.col('h.min_dte'), F.col('a.min_dte'))) \
                          .withColumn('h_max', F.coalesce(F.col('h.max_dte'), F.col('a.max_dte'))) \
                          .select(F.col('keyword').alias('keyword'),
-                                 F.when(F.col('a.min_dte') < F.col('h_min'), F.col('a.min_dte')).otherwise(F.col('h_max')).alias('min_dte'),
-                                 F.when(F.col('a.max_dte') > F.col('h_max'), F.col('a.max_dte')).otherwise(F.col('h_min')).alias('max_dte')) \
+                                 F.when(F.col('a.min_dte') < F.col('h_min'), F.col('a.min_dte')).otherwise(F.col('h_min')).alias('min_dte'),
+                                 F.when(F.col('a.max_dte') > F.col('h_max'), F.col('a.max_dte')).otherwise(F.col('h_max')).alias('max_dte')) \
                          .filter(F.col('min_dte') <= F.col('max_dte')).collect()
     return [r.asDict() for r in args]
 
@@ -96,13 +108,51 @@ def download_articles(accession_id: str,
   from botocore.client import Config  
 
   s3_conn = boto3.client('s3', config=Config(signature_version=UNSIGNED))
-  try:
-    s3_conn.download_file("pmc-oa-opendata",
+
+  s3_conn.download_file("pmc-oa-opendata",
                           f'oa_comm/{file_type}/all/{accession_id}.{file_type}',
                           f'{articles_path}/{accession_id}.{file_type}')
-    return "DOWNLOADED"
-  except:
-    return "ERROR"
+  return "DOWNLOADED"
+
+def download_articles(article: Row):
+  import boto3
+  from botocore import UNSIGNED
+  from botocore.client import Config
+
+  s3_conn = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+
+  s3_conn.download_file("pmc-oa-opendata",
+                          f'oa_comm/xml/all/{article["AccessionID"]}.xml',
+                          f'{article["volume_path"]}')
+  return "DOWNLOADED"
+  
+@udf(returnType=StructType([
+    StructField("attrs", MapType(StringType(), StringType())), 
+    StructField("front", StringType()),
+    StructField("body", StringType()),
+    StructField("floats_group", StringType()),
+    StructField("back", StringType()),
+    StructField("processing_metadata", StringType())
+]))
+def curate_xml_dict(xmlPath: str):
+    try:
+      with open(xmlPath, 'r') as file:
+          file_content = file.read()
+      soup = BeautifulSoup(file_content, 'xml')
+      article_detail_map = {'dtd-version': 'dtd_version',
+                            'xml:lang': 'xml_lang',
+                            'article-type': 'article_type',
+                            'xmlns:mml': 'xmlns_mml',
+                            'xmlns:xlink': 'xmlns_xlink'}
+      article_dict = {'attrs': {article_detail_map[k]: str(v) for k, v in soup.find('article').attrs.items() if k in article_detail_map.keys()},
+                      'front':               str(soup.find('front')),
+                      'body':                str(soup.find('body')),
+                      'floats_group':        str(soup.find('floats-group')),
+                      'back':                str(soup.find('back')),
+                      'processing_metadata': str(soup.find('processing-meta'))}
+      return article_dict
+    except:
+      return None
 
 # COMMAND ----------
 
@@ -110,13 +160,15 @@ def download_articles(accession_id: str,
 # If keywords is left blank, range will be applied to all keywords aleady in search hist
 
 from pyspark.sql import functions as F
+from multiprocessing import Pool
 
 def get_needed_pmids_df(search_hist: PubMedAsset,
                         metadata: PubMedAsset,
                         articles: PubMedAsset,
                         keywords: Union[str, List[str]] = None,
                         min_dte: str = "2022/01/01",
-                        max_dte: Optional[str] = None):
+                        max_dte: Optional[str] = None,
+                        debugPartitions: bool = False):
     
     if keywords:
         keywords: [str] = keywords if isinstance(keywords, list) else [str(keywords),]
@@ -128,27 +180,47 @@ def get_needed_pmids_df(search_hist: PubMedAsset,
     max_dte = max_dte or datetime.today().strftime('%Y/%m/%d')
     
     kwargs_list = get_search_hist_args(keywords, search_hist, min_dte, max_dte)
-
+    
     pmids = searchPMCPapers(**kwargs_list[0])
 
     for kwargs in kwargs_list[1:]:
         sleep(0.5) #limit 2 api calls/sec
         pmids |= searchPMCPapers(**kwargs)
 
+    print(f"Retrieved {len(pmids)} articles from api")
+
     pmids_df = metadata.df.sparkSession.createDataFrame([(i,) for i in pmids], "AccessionId STRING")
     file_type = metadata.name.split('_')[-1]
     articles_path = articles.path
 
     # NOTE: download_articles udf actually downloads the articles in addition to returning DOWNLOAD or ERROR status
+    # NOTE: this script isn't downloading anything yet, it will be done in the driver node only. Issue to be resolved in udf.
     metadata_src = metadata.df.filter(F.col('Status') == F.lit('PENDING')) \
                            .join(pmids_df, "AccessionId", "leftsemi") \
+                           .repartition(64) \
                            .withColumn("Status",
                                        F.when(F.col('Retracted') == F.lit('yes'), F.lit("RETRACTED")) \
-                                       .otherwise(download_articles(F.col("AccessionId"),
-                                                                    F.lit(articles_path),
-                                                                    F.lit(file_type)))) \
+                                       .otherwise(F.lit("DOWNLOADED"))) \
                            .withColumn("volume_path", F.when(F.col('Status')==F.lit("DOWNLOADED"),
                                                              F.concat(F.lit(articles_path), F.lit('/'), F.col("AccessionId"), F.lit('.'), F.lit(file_type)))).cache()
+                           
+    to_download_count = metadata_src.count()
+    print(f"Downloading {to_download_count} articles")
+
+    to_download = metadata_src.collect()
+
+    #Driver parallel download of articles
+    pool = Pool()
+    results = pool.map(download_articles, to_download)
+    pool.close()
+    pool.join()
+    
+    if debugPartitions:
+        print(":::::::::::::::DEBUG PARTITIONS:::::::::::::::")
+        dfWithPartId = metadata_src.withColumn("partId", F.spark_partition_id())
+        dfWithPartIdGrp = dfWithPartId.groupBy("partId").count()
+        dfWithPartIdGrp.show(100)
+        print(":::::::::::::::::::::::::::::::::::::::::::::::")
 
     # Update metadata table
     metadata.dt.alias("tgt").merge(source = metadata_src.alias("src"),

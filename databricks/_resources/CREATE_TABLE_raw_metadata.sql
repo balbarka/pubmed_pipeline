@@ -22,4 +22,5 @@ TBLPROPERTIES (
   'delta.enableRowTracking' = 'true',
   'delta.feature.deletionVectors' = 'supported',
   'delta.feature.rowTracking' = 'supported',
-  'delta.feature.v2Checkpoint' = 'supported')
+  'delta.feature.v2Checkpoint' = 'supported',
+  'delta.enableChangeDataFeed' = 'true')
