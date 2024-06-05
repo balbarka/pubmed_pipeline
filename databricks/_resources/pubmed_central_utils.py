@@ -114,17 +114,17 @@ def download_articles(accession_id: str,
                           f'{articles_path}/{accession_id}.{file_type}')
   return "DOWNLOADED"
 
-def download_articles(article: Row):
-  import boto3
-  from botocore import UNSIGNED
-  from botocore.client import Config
+#def download_articles(article: Row):
+#  import boto3
+#  from botocore import UNSIGNED
+#  from botocore.client import Config
 
-  s3_conn = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+#  s3_conn = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
-  s3_conn.download_file("pmc-oa-opendata",
-                          f'oa_comm/xml/all/{article["AccessionID"]}.xml',
-                          f'{article["volume_path"]}')
-  return "DOWNLOADED"
+#  s3_conn.download_file("pmc-oa-opendata",
+#                          f'oa_comm/xml/all/{article["AccessionID"]}.xml',
+#                          f'{article["volume_path"]}')
+#  return "DOWNLOADED"
   
 @udf(returnType=StructType([
     StructField("attrs", MapType(StringType(), StringType())), 
@@ -194,33 +194,46 @@ def get_needed_pmids_df(search_hist: PubMedAsset,
     articles_path = articles.path
 
     # NOTE: download_articles udf actually downloads the articles in addition to returning DOWNLOAD or ERROR status
-    # NOTE: this script isn't downloading anything yet, it will be done in the driver node only. Issue to be resolved in udf.
     metadata_src = metadata.df.filter(F.col('Status') == F.lit('PENDING')) \
                            .join(pmids_df, "AccessionId", "leftsemi") \
                            .repartition(64) \
                            .withColumn("Status",
                                        F.when(F.col('Retracted') == F.lit('yes'), F.lit("RETRACTED")) \
-                                       .otherwise(F.lit("DOWNLOADED"))) \
+                                       .otherwise(download_articles(F.col("AccessionId"),
+                                                                    F.lit(articles_path),
+                                                                    F.lit(file_type)))) \
                            .withColumn("volume_path", F.when(F.col('Status')==F.lit("DOWNLOADED"),
                                                              F.concat(F.lit(articles_path), F.lit('/'), F.col("AccessionId"), F.lit('.'), F.lit(file_type)))).cache()
-                           
-    to_download_count = metadata_src.count()
-    print(f"Downloading {to_download_count} articles")
 
-    to_download = metadata_src.collect()
+
+    
+    # NOTE: this script isn't downloading anything yet, it will be done in the driver node only. Issue to be resolved in udf.
+    #metadata_src = metadata.df.filter(F.col('Status') == F.lit('PENDING')) \
+    #                       .join(pmids_df, "AccessionId", "leftsemi") \
+    #                       .repartition(64) \
+    #                       .withColumn("Status",
+    #                                   F.when(F.col('Retracted') == F.lit('yes'), F.lit("RETRACTED")) \
+    #                                   .otherwise(F.lit("DOWNLOADED"))) \
+    #                       .withColumn("volume_path", F.when(F.col('Status')==F.lit("DOWNLOADED"),
+    #                                                         F.concat(F.lit(articles_path), F.lit('/'), F.col("AccessionId"), F.lit('.'), F.lit(file_type)))).cache()
+                           
+    #to_download_count = metadata_src.count()
+    #print(f"Downloading {to_download_count} articles")
+
+    #to_download = metadata_src.collect()
 
     #Driver parallel download of articles
-    pool = Pool()
-    results = pool.map(download_articles, to_download)
-    pool.close()
-    pool.join()
+    #pool = Pool()
+    #results = pool.map(download_articles, to_download)
+    #pool.close()
+    #pool.join()
     
-    if debugPartitions:
-        print(":::::::::::::::DEBUG PARTITIONS:::::::::::::::")
-        dfWithPartId = metadata_src.withColumn("partId", F.spark_partition_id())
-        dfWithPartIdGrp = dfWithPartId.groupBy("partId").count()
-        dfWithPartIdGrp.show(100)
-        print(":::::::::::::::::::::::::::::::::::::::::::::::")
+    #if debugPartitions:
+    #    print(":::::::::::::::DEBUG PARTITIONS:::::::::::::::")
+    #    dfWithPartId = metadata_src.withColumn("partId", F.spark_partition_id())
+    #    dfWithPartIdGrp = dfWithPartId.groupBy("partId").count()
+    #    dfWithPartIdGrp.show(100)
+    #    print(":::::::::::::::::::::::::::::::::::::::::::::::")
 
     # Update metadata table
     metadata.dt.alias("tgt").merge(source = metadata_src.alias("src"),
